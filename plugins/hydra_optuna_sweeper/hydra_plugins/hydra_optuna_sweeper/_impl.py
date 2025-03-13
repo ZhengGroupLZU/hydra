@@ -35,11 +35,8 @@ from optuna.distributions import (
     BaseDistribution,
     CategoricalChoiceType,
     CategoricalDistribution,
-    DiscreteUniformDistribution,
-    IntLogUniformDistribution,
-    IntUniformDistribution,
-    LogUniformDistribution,
-    UniformDistribution,
+    IntDistribution,
+    FloatDistribution,
 )
 from optuna.trial import Trial
 
@@ -48,9 +45,7 @@ from .config import Direction, DistributionConfig, DistributionType
 log = logging.getLogger(__name__)
 
 
-def create_optuna_distribution_from_config(
-    config: MutableMapping[str, Any]
-) -> BaseDistribution:
+def create_optuna_distribution_from_config(config: MutableMapping[str, Any]) -> BaseDistribution:
     kwargs = dict(config)
     if isinstance(config["type"], str):
         kwargs["type"] = DistributionType[config["type"]]
@@ -62,17 +57,17 @@ def create_optuna_distribution_from_config(
         assert param.low is not None
         assert param.high is not None
         if param.log:
-            return IntLogUniformDistribution(int(param.low), int(param.high))
+            return IntDistribution(int(param.low), int(param.high), log=True)
         step = int(param.step) if param.step is not None else 1
-        return IntUniformDistribution(int(param.low), int(param.high), step=step)
+        return IntDistribution(int(param.low), int(param.high), step=step)
     if param.type == DistributionType.float:
         assert param.low is not None
         assert param.high is not None
         if param.log:
-            return LogUniformDistribution(param.low, param.high)
+            return FloatDistribution(param.low, param.high, log=True)
         if param.step is not None:
-            return DiscreteUniformDistribution(param.low, param.high, param.step)
-        return UniformDistribution(param.low, param.high)
+            return FloatDistribution(param.low, param.high, step=param.step)
+        return FloatDistribution(param.low, param.high)
     raise NotImplementedError(f"{param.type} is not supported by Optuna sweeper.")
 
 
@@ -85,9 +80,9 @@ def create_optuna_distribution_from_override(override: Override) -> Any:
     if override.is_choice_sweep():
         assert isinstance(value, ChoiceSweep)
         for x in override.sweep_iterator(transformer=Transformer.encode):
-            assert isinstance(
-                x, (str, int, float, bool, type(None))
-            ), f"A choice sweep expects str, int, float, bool, or None type. Got {type(x)}."
+            assert isinstance(x, (str, int, float, bool, type(None))), (
+                f"A choice sweep expects str, int, float, bool, or None type. Got {type(x)}."
+            )
             choices.append(x)
         return CategoricalDistribution(choices)
 
@@ -97,9 +92,9 @@ def create_optuna_distribution_from_override(override: Override) -> Any:
         assert value.stop is not None
         if value.shuffle:
             for x in override.sweep_iterator(transformer=Transformer.encode):
-                assert isinstance(
-                    x, (str, int, float, bool, type(None))
-                ), f"A choice sweep expects str, int, float, bool, or None type. Got {type(x)}."
+                assert isinstance(x, (str, int, float, bool, type(None))), (
+                    f"A choice sweep expects str, int, float, bool, or None type. Got {type(x)}."
+                )
                 choices.append(x)
             return CategoricalDistribution(choices)
         if (
@@ -107,23 +102,16 @@ def create_optuna_distribution_from_override(override: Override) -> Any:
             or isinstance(value.stop, float)
             or isinstance(value.step, float)
         ):
-            return DiscreteUniformDistribution(value.start, value.stop, value.step)
-        return IntUniformDistribution(
-            int(value.start), int(value.stop), step=int(value.step)
-        )
+            return FloatDistribution(value.start, value.stop, step=value.step)
+        return IntDistribution(int(value.start), int(value.stop), step=int(value.step))
 
     if override.is_interval_sweep():
         assert isinstance(value, IntervalSweep)
         assert value.start is not None
         assert value.end is not None
-        if "log" in value.tags:
-            if isinstance(value.start, int) and isinstance(value.end, int):
-                return IntLogUniformDistribution(int(value.start), int(value.end))
-            return LogUniformDistribution(value.start, value.end)
-        else:
-            if isinstance(value.start, int) and isinstance(value.end, int):
-                return IntUniformDistribution(value.start, value.end)
-            return UniformDistribution(value.start, value.end)
+        if isinstance(value.start, int) and isinstance(value.end, int):
+            return IntDistribution(value.start, value.end, log="log" in value.tags)
+        return FloatDistribution(value.start, value.end, log="log" in value.tags)
 
     raise NotImplementedError(f"{override} is not supported by Optuna sweeper.")
 
@@ -169,9 +157,7 @@ class OptunaSweeperImpl(Sweeper):
         self.max_failure_rate = max_failure_rate
         assert self.max_failure_rate >= 0.0
         assert self.max_failure_rate <= 1.0
-        self.custom_search_space_extender: Optional[
-            Callable[[DictConfig, Trial], None]
-        ] = None
+        self.custom_search_space_extender: Optional[Callable[[DictConfig, Trial], None]] = None
         if custom_search_space:
             self.custom_search_space_extender = get_method(custom_search_space)
         self.search_space = search_space
@@ -237,6 +223,7 @@ class OptunaSweeperImpl(Sweeper):
         for trial in trials:
             for param_name, distribution in search_space_distributions.items():
                 assert type(param_name) is str
+                log.info(f"{param_name} is {distribution}")
                 trial._suggest(param_name, distribution)
             for param_name, value in fixed_params.items():
                 trial.set_user_attr(param_name, value)
@@ -266,15 +253,17 @@ class OptunaSweeperImpl(Sweeper):
     def _to_grid_sampler_choices(self, distribution: BaseDistribution) -> Any:
         if isinstance(distribution, CategoricalDistribution):
             return distribution.choices
-        elif isinstance(distribution, IntUniformDistribution):
-            assert (
-                distribution.step is not None
-            ), "`step` of IntUniformDistribution must be a positive integer."
+        elif isinstance(distribution, IntDistribution):
+            assert distribution.step is not None, (
+                "`step` of IntUniformDistribution must be a positive integer."
+            )
             n_items = (distribution.high - distribution.low) // distribution.step
             return [distribution.low + i * distribution.step for i in range(n_items)]
-        elif isinstance(distribution, DiscreteUniformDistribution):
-            n_items = int((distribution.high - distribution.low) // distribution.q)
-            return [distribution.low + i * distribution.q for i in range(n_items)]
+        elif isinstance(distribution, FloatDistribution):
+            step = distribution.step
+            assert step is not None, "`step` of FloatUniformDistribution must be a positive number."
+            n_items = int((distribution.high - distribution.low) // step)
+            return [distribution.low + i * step for i in range(n_items)]
         else:
             raise ValueError("GridSampler only supports discrete distributions.")
 
@@ -314,9 +303,7 @@ class OptunaSweeperImpl(Sweeper):
             for v in search_space_for_grid_sampler.values():
                 n_trial *= len(v)
             self.n_trials = min(self.n_trials, n_trial)
-            log.info(
-                f"Updating num of trials to {self.n_trials} due to using GridSampler."
-            )
+            log.info(f"Updating num of trials to {self.n_trials} due to using GridSampler.")
 
         # Remove fixed parameters from Optuna search space.
         for param_name in fixed_params:
@@ -325,6 +312,9 @@ class OptunaSweeperImpl(Sweeper):
 
         directions = self._get_directions()
 
+        # if isinstance(self.sampler, functools.partial):
+        #     if self.sampler.func == optuna.samplers.TPESampler:
+        #         self.sampler =
         study = optuna.create_study(
             study_name=self.study_name,
             storage=self.storage,
@@ -332,21 +322,56 @@ class OptunaSweeperImpl(Sweeper):
             directions=directions,
             load_if_exists=True,
         )
+
+        trials = study.get_trials(deepcopy=False)
+        # completed_trials = study.get_trials(states=(optuna.trial.TrialState.COMPLETE,))
+        completed_trials = list(
+            [
+                trial
+                for trial in trials
+                if trial.state
+                not in {optuna.trial.TrialState.RUNNING, optuna.trial.TrialState.WAITING}
+            ]
+        )
+        n_completed_trials = len(completed_trials)
+        if len(trials) != n_completed_trials:
+            print(
+                f"Some trials are not completed, will keep {n_completed_trials} out of {len(trials)}"
+            )
+            assert self.study_name is not None
+            optuna.delete_study(study_name=self.study_name, storage=self.storage)
+            study = optuna.create_study(
+                study_name=self.study_name,
+                storage=self.storage,
+                sampler=self.sampler,
+                directions=directions,
+                load_if_exists=True,
+            )
+            study.add_trials(completed_trials)
+
         log.info(f"Study name: {study.study_name}")
         log.info(f"Storage: {self.storage}")
         log.info(f"Sampler: {type(self.sampler).__name__}")
         log.info(f"Directions: {directions}")
 
+        # completed_trials = study.get_trials(deepcopy=False, states=(optuna.trial.TrialState.COMPLETE,))
+        # failed_trials = study.get_trials(deepcopy=False, states=(optuna.trial.TrialState.FAIL,))
+
+        # log.info(f"Completed trials: {n_completed_trials}")
+        # log.info(f"Failed trials: {len(failed_trials)}")
+        # study.add_trials(completed_trials)
+        # log.info(f"Added {n_completed_trials} completed trials to study.")
+
         batch_size = self.n_jobs
-        n_trials_to_go = self.n_trials
+        n_trials_to_go = self.n_trials - n_completed_trials
+        self.job_idx = n_completed_trials
+        log.info(f"{n_trials_to_go=}, {self.job_idx=}, {n_completed_trials=}")
 
         while n_trials_to_go > 0:
             batch_size = min(n_trials_to_go, batch_size)
 
             trials = [study.ask() for _ in range(batch_size)]
-            overrides = self._configure_trials(
-                trials, search_space_distributions, fixed_params
-            )
+            overrides = self._configure_trials(trials, search_space_distributions, fixed_params)
 
             returns = self.launcher.launch(overrides, initial_job_idx=self.job_idx)
             self.job_idx += len(returns)
@@ -418,9 +443,7 @@ class OptunaSweeperImpl(Sweeper):
             log.info(f"Best value: {best_trial.value}")
         else:
             best_trials = study.best_trials
-            pareto_front = [
-                {"params": t.params, "values": t.values} for t in best_trials
-            ]
+            pareto_front = [{"params": t.params, "values": t.values} for t in best_trials]
             results_to_serialize = {
                 "name": "optuna",
                 "solutions": pareto_front,
